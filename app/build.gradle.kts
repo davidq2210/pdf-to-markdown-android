@@ -63,4 +63,5 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended:1.7.5")
     implementation("org.apache.poi:poi:5.2.3")
     implementation("org.apache.poi:poi-ooxml:5.2.3")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }

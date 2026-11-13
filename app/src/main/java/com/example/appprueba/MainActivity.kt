@@ -6,9 +6,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -54,6 +56,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.appprueba.ui.theme.AppPruebaTheme
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.cos.COSBase
 import com.tom_roush.pdfbox.cos.COSName
@@ -76,12 +81,15 @@ import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.util.Matrix as PdfMatrix
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.apache.poi.xwpf.usermodel.XWPFDocument
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.Locale
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 enum class NivelCompresion(val etiqueta: String, val calidad: Float, val maxDimension: Int) {
     LIGERA("Ligera", 0.75f, 1600),
@@ -148,22 +156,53 @@ fun ConversorPdfScreen(modifier: Modifier = Modifier) {
     var textoMarkdown by remember { mutableStateOf("") }
     var estaProcesando by remember { mutableStateOf(false) }
     var nombreArchivo by remember { mutableStateOf("") }
+    var uriSeleccionada by remember { mutableStateOf<Uri?>(null) }
+    var modoOcrActivo by rememberSaveable { mutableStateOf(false) }
+    var mensajeProgreso by remember { mutableStateOf("Extrayendo y formateando documento...") }
+
+    fun procesarDocumento(uri: Uri, forzarOcr: Boolean) {
+        coroutineScope.launch {
+            estaProcesando = true
+            textoMarkdown = ""
+            mensajeProgreso = "Extrayendo y formateando documento..."
+
+            val resultado = withContext(Dispatchers.IO) {
+                var usarOcr = forzarOcr
+                var textoExtraido = ""
+
+                if (!usarOcr) {
+                    textoExtraido = procesarPdfAMarkdown(context, uri)
+                    val charsNoVacios = textoExtraido.count { !it.isWhitespace() }
+                    if (charsNoVacios < 25 || textoExtraido.startsWith("Error al procesar el PDF:")) {
+                        usarOcr = true
+                        withContext(Dispatchers.Main) {
+                            modoOcrActivo = true
+                        }
+                    }
+                }
+
+                if (usarOcr) {
+                    ejecutarOcrLocal(context, uri) { estado ->
+                        withContext(Dispatchers.Main) {
+                            mensajeProgreso = estado
+                        }
+                    }
+                } else {
+                    textoExtraido
+                }
+            }
+            textoMarkdown = resultado
+            estaProcesando = false
+        }
+    }
 
     val selectorPdf = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
+            uriSeleccionada = it
             nombreArchivo = it.lastPathSegment?.substringAfterLast("/") ?: "documento.pdf"
-            estaProcesando = true
-            textoMarkdown = ""
-
-            coroutineScope.launch {
-                val resultado = withContext(Dispatchers.IO) {
-                    procesarPdfAMarkdown(context, it)
-                }
-                textoMarkdown = resultado
-                estaProcesando = false
-            }
+            procesarDocumento(it, modoOcrActivo)
         }
     }
 
@@ -244,6 +283,29 @@ fun ConversorPdfScreen(modifier: Modifier = Modifier) {
                         Text(if (nombreArchivo.isEmpty()) "Seleccionar PDF" else "Cambiar PDF")
                     }
 
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    FilterChip(
+                        selected = modoOcrActivo,
+                        onClick = {
+                            val nuevoModo = !modoOcrActivo
+                            modoOcrActivo = nuevoModo
+                            uriSeleccionada?.let { uri ->
+                                if (!estaProcesando) {
+                                    procesarDocumento(uri, nuevoModo)
+                                }
+                            }
+                        },
+                        label = { Text("Modo OCR (PDF escaneado)") },
+                        leadingIcon = {
+                            Icon(
+                                if (modoOcrActivo) Icons.Filled.DocumentScanner else Icons.Outlined.DocumentScanner,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    )
+
                     if (nombreArchivo.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(10.dp))
                         Row(
@@ -276,7 +338,7 @@ fun ConversorPdfScreen(modifier: Modifier = Modifier) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth(0.8f))
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "Extrayendo y formateando documento...",
+                        text = mensajeProgreso,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.outline
                     )
@@ -2264,6 +2326,76 @@ private fun extraerPaginasPdf(
             try { it.close() } catch (_: Exception) {}
         }
         try { sourceDoc?.close() } catch (_: Exception) {}
+    }
+}
+
+private suspend fun <T> com.google.android.gms.tasks.Task<T>.awaitTask(): T =
+    suspendCancellableCoroutine { cont ->
+        addOnSuccessListener { result ->
+            if (cont.isActive) cont.resume(result)
+        }
+        addOnFailureListener { exception ->
+            if (cont.isActive) cont.resumeWithException(exception)
+        }
+        addOnCanceledListener {
+            cont.cancel()
+        }
+    }
+
+private suspend fun ejecutarOcrLocal(
+    context: Context,
+    uri: Uri,
+    onProgreso: suspend (String) -> Unit
+): String {
+    var pfd: ParcelFileDescriptor? = null
+    var renderer: PdfRenderer? = null
+    val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    val sb = StringBuilder()
+
+    return try {
+        pfd = context.contentResolver.openFileDescriptor(uri, "r")
+        if (pfd == null) return "Error: No se pudo abrir el archivo PDF."
+        renderer = PdfRenderer(pfd)
+        val totalPaginas = renderer.pageCount
+        if (totalPaginas == 0) return "El documento PDF no contiene páginas."
+
+        for (i in 0 until totalPaginas) {
+            onProgreso("Ejecutando OCR local: página ${i + 1} de $totalPaginas...")
+            val page = renderer.openPage(i)
+            try {
+                val maxDim = maxOf(page.width, page.height)
+                val factor = if (maxDim > 0) (2000f / maxDim).coerceAtMost(2.0f) else 1.0f
+                val targetW = (page.width * factor).toInt().coerceAtLeast(1)
+                val targetH = (page.height * factor).toInt().coerceAtLeast(1)
+
+                val bitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.drawColor(android.graphics.Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                val image = InputImage.fromBitmap(bitmap, 0)
+                val visionText = recognizer.process(image).awaitTask()
+                bitmap.recycle()
+
+                val text = visionText.text.trim()
+                if (text.isNotEmpty()) {
+                    sb.append("## Página ${i + 1}\n\n").append(text).append("\n\n")
+                }
+            } finally {
+                try {
+                    page.close()
+                } catch (_: Exception) {}
+            }
+        }
+
+        val res = sb.toString().trim()
+        if (res.isEmpty()) "No se detectó texto en el PDF escaneado." else res
+    } catch (e: Exception) {
+        "Error durante el reconocimiento OCR: ${e.localizedMessage ?: e.message}"
+    } finally {
+        try { recognizer.close() } catch (_: Exception) {}
+        try { renderer?.close() } catch (_: Exception) {}
+        try { pfd?.close() } catch (_: Exception) {}
     }
 }
 
