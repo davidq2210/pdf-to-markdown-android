@@ -241,7 +241,7 @@ fun ConversorPdfScreen(modifier: Modifier = Modifier) {
             TopAppBar(
                 title = {
                     Text(
-                        "PDF to Markdown",
+                        "PDFBok",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.SemiBold
                     )
